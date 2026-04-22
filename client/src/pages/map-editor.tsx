@@ -5,7 +5,8 @@ import {
   TooltipTrigger,
   TooltipContent,
 } from "@/components/ui/tooltip";
-import { Upload, Pen, CheckCircle, Trash2, Download, Maximize2 } from "lucide-react";
+import { Upload, Pen, CheckCircle, Trash2, Download, Maximize2, Layers, ArrowLeftRight } from "lucide-react";
+import { useToast } from "@/hooks/use-toast";
 
 interface Point {
   x: number;
@@ -214,18 +215,26 @@ export default function MapEditor() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const refFileInputRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
+  const imageBRef = useRef<HTMLImageElement | null>(null);
+  const { toast } = useToast();
 
   const [points, setPoints] = useState<Point[]>([]);
   const [closed, setClosed] = useState(false);
   const [drawingMode, setDrawingMode] = useState(false);
   const [hasImage, setHasImage] = useState(false);
+  const [hasImageB, setHasImageB] = useState(false);
+  const [activeImage, setActiveImage] = useState<1 | 2>(1);
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const [hoveredPoint, setHoveredPoint] = useState<number | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [zoomDisplay, setZoomDisplay] = useState(100);
   const [bloomPoints, setBloomPoints] = useState<string>("");
   const [bloomViewBox, setBloomViewBox] = useState("0 0 0 0");
+
+  const activeImageRef = useRef<1 | 2>(1);
+  useEffect(() => { activeImageRef.current = activeImage; }, [activeImage]);
 
   const viewZoomRef = useRef(1);
   const viewPanXRef = useRef(0);
@@ -251,9 +260,13 @@ export default function MapEditor() {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
+    const displayImage =
+      activeImageRef.current === 2 && imageBRef.current
+        ? imageBRef.current
+        : imageRef.current;
     drawScene(
       ctx,
-      imageRef.current,
+      displayImage,
       pointsRef.current,
       closedRef.current,
       canvas.width,
@@ -315,7 +328,7 @@ export default function MapEditor() {
 
   useEffect(() => {
     renderRef.current();
-  }, [points, closed]);
+  }, [points, closed, activeImage]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -370,7 +383,10 @@ export default function MapEditor() {
         const img = new Image();
         img.onload = () => {
           imageRef.current = img;
+          imageBRef.current = null;
           setHasImage(true);
+          setHasImageB(false);
+          setActiveImage(1);
           setPoints([]);
           setClosed(false);
           setDrawingMode(false);
@@ -383,6 +399,36 @@ export default function MapEditor() {
       reader.readAsDataURL(file);
     },
     [fitImageToView]
+  );
+
+  const loadReferenceImage = useCallback(
+    (file: File) => {
+      const main = imageRef.current;
+      if (!main) return;
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          if (
+            img.naturalWidth !== main.naturalWidth ||
+            img.naturalHeight !== main.naturalHeight
+          ) {
+            toast({
+              title: "Resolution mismatch",
+              description: `Reference must be ${main.naturalWidth}×${main.naturalHeight}. Got ${img.naturalWidth}×${img.naturalHeight}.`,
+              variant: "destructive",
+            });
+            return;
+          }
+          imageBRef.current = img;
+          setHasImageB(true);
+          setActiveImage(2);
+        };
+        img.src = e.target?.result as string;
+      };
+      reader.readAsDataURL(file);
+    },
+    [toast]
   );
 
   const canvasToImage = useCallback(
@@ -579,6 +625,15 @@ export default function MapEditor() {
     [loadImage]
   );
 
+  const handleReferenceFileChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (file) loadReferenceImage(file);
+      e.target.value = "";
+    },
+    [loadReferenceImage]
+  );
+
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
   }, []);
@@ -618,6 +673,44 @@ export default function MapEditor() {
             </Button>
           </TooltipTrigger>
           <TooltipContent side="right">Upload Map Image</TooltipContent>
+        </Tooltip>
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              data-testid="button-upload-reference"
+              onClick={() => refFileInputRef.current?.click()}
+              disabled={!hasImage}
+              className={hasImageB ? "text-[#FF4500]" : "text-gray-300"}
+            >
+              <Layers />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="right">
+            Upload Reference (same size, not exported)
+          </TooltipContent>
+        </Tooltip>
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              data-testid="button-switch-view"
+              onClick={() =>
+                setActiveImage((prev) => (prev === 1 ? 2 : 1))
+              }
+              disabled={!hasImageB}
+              className={activeImage === 2 ? "text-[#FF4500]" : "text-gray-300"}
+            >
+              <ArrowLeftRight />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="right">
+            Switch View (currently: {activeImage === 1 ? "Main" : "Reference"})
+          </TooltipContent>
         </Tooltip>
 
         <Tooltip>
@@ -733,6 +826,14 @@ export default function MapEditor() {
           onChange={handleFileChange}
           data-testid="input-file"
         />
+        <input
+          ref={refFileInputRef}
+          type="file"
+          accept="image/png,image/jpeg"
+          className="hidden"
+          onChange={handleReferenceFileChange}
+          data-testid="input-file-reference"
+        />
 
         <canvas
           ref={canvasRef}
@@ -782,11 +883,28 @@ export default function MapEditor() {
 
         {hasImage && (
           <div
-            className="absolute bottom-3 right-3 px-2 py-1 rounded-md text-xs text-gray-400 pointer-events-none"
-            style={{ backgroundColor: "rgba(0,0,0,0.5)" }}
-            data-testid="text-zoom-level"
+            className="absolute bottom-3 right-3 flex gap-2 pointer-events-none"
+            data-testid="hud"
           >
-            {zoomDisplay}%
+            {hasImageB && (
+              <div
+                className="px-2 py-1 rounded-md text-xs"
+                style={{
+                  backgroundColor: "rgba(0,0,0,0.5)",
+                  color: activeImage === 2 ? "#FF4500" : "#9ca3af",
+                }}
+                data-testid="text-active-view"
+              >
+                {activeImage === 1 ? "Main" : "Reference"}
+              </div>
+            )}
+            <div
+              className="px-2 py-1 rounded-md text-xs text-gray-400"
+              style={{ backgroundColor: "rgba(0,0,0,0.5)" }}
+              data-testid="text-zoom-level"
+            >
+              {zoomDisplay}%
+            </div>
           </div>
         )}
 
