@@ -5,13 +5,42 @@ import {
   TooltipTrigger,
   TooltipContent,
 } from "@/components/ui/tooltip";
-import { Upload, Pen, CheckCircle, Trash2, Download, Maximize2, Layers, ArrowLeftRight } from "lucide-react";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetDescription,
+} from "@/components/ui/sheet";
+import {
+  Upload,
+  Pen,
+  CheckCircle,
+  Trash2,
+  Download,
+  Maximize2,
+  Layers,
+  ArrowLeftRight,
+  Spline as SplineIcon,
+  History,
+} from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
-
-interface Point {
-  x: number;
-  y: number;
-}
+import {
+  computePathPoints,
+  type Point,
+  type PathMode,
+} from "@/lib/spline";
+import {
+  saveSession,
+  loadSession,
+  addHistoryEntry,
+  listHistory,
+  deleteHistoryEntry,
+  clearHistory,
+  blobToImage,
+  canvasToBlob,
+  type HistoryEntry,
+} from "@/lib/storage";
 
 function createStripePattern(): HTMLCanvasElement {
   const size = 60;
@@ -77,8 +106,10 @@ function drawScene(
   zoom: number,
   panX: number,
   panY: number,
-  exportMode: boolean = false
+  exportMode: boolean = false,
+  controlPoints?: Point[]
 ) {
+  const markerPoints = controlPoints ?? points;
   ctx.clearRect(0, 0, canvasWidth, canvasHeight);
 
   if (!exportMode) {
@@ -194,12 +225,12 @@ function drawScene(
     ctx.restore();
   }
 
-  if (!exportMode && points.length > 0) {
-    const displayPoints = points.map((p) => ({
+  if (!exportMode && markerPoints.length > 0) {
+    const displayMarkers = markerPoints.map((p) => ({
       x: p.x * zoom + panX,
       y: p.y * zoom + panY,
     }));
-    for (const dp of displayPoints) {
+    for (const dp of displayMarkers) {
       ctx.beginPath();
       ctx.arc(dp.x, dp.y, 6, 0, Math.PI * 2);
       ctx.fillStyle = "white";
@@ -211,6 +242,71 @@ function drawScene(
   }
 }
 
+function HistoryCard({
+  entry,
+  onDownload,
+  onDelete,
+}: {
+  entry: HistoryEntry;
+  onDownload: () => void;
+  onDelete: () => void;
+}) {
+  const [thumbUrl, setThumbUrl] = useState<string>("");
+  useEffect(() => {
+    const url = URL.createObjectURL(entry.exportBlob);
+    setThumbUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [entry.exportBlob]);
+
+  const date = new Date(entry.ts);
+  const dateStr = date.toLocaleString();
+
+  return (
+    <div
+      className="flex gap-3 p-2 rounded border"
+      style={{ backgroundColor: "#252540", borderColor: "#333350" }}
+      data-testid={`history-entry-${entry.id}`}
+    >
+      {thumbUrl && (
+        <img
+          src={thumbUrl}
+          alt=""
+          className="w-20 h-20 object-cover rounded"
+          style={{ backgroundColor: "#000" }}
+        />
+      )}
+      <div className="flex-1 flex flex-col justify-between min-w-0">
+        <div>
+          <div className="text-xs text-gray-300">{dateStr}</div>
+          <div className="text-xs text-gray-500">
+            {entry.width}×{entry.height} · {entry.pathMode} ·{" "}
+            {entry.points.length} pts
+          </div>
+        </div>
+        <div className="flex gap-1">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onDownload}
+            className="text-gray-300 h-7 px-2"
+          >
+            <Download className="w-3 h-3 mr-1" />
+            PNG
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onDelete}
+            className="text-gray-400 hover:text-red-400 h-7 px-2"
+          >
+            <Trash2 className="w-3 h-3" />
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function MapEditor() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -218,6 +314,9 @@ export default function MapEditor() {
   const refFileInputRef = useRef<HTMLInputElement>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const imageBRef = useRef<HTMLImageElement | null>(null);
+  const mainImageBlobRef = useRef<Blob | null>(null);
+  const refImageBlobRef = useRef<Blob | null>(null);
+  const hydratedRef = useRef(false);
   const { toast } = useToast();
 
   const [points, setPoints] = useState<Point[]>([]);
@@ -226,15 +325,20 @@ export default function MapEditor() {
   const [hasImage, setHasImage] = useState(false);
   const [hasImageB, setHasImageB] = useState(false);
   const [activeImage, setActiveImage] = useState<1 | 2>(1);
+  const [pathMode, setPathMode] = useState<PathMode>("polygon");
   const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
   const [hoveredPoint, setHoveredPoint] = useState<number | null>(null);
   const [isDragOver, setIsDragOver] = useState(false);
   const [zoomDisplay, setZoomDisplay] = useState(100);
   const [bloomPoints, setBloomPoints] = useState<string>("");
   const [bloomViewBox, setBloomViewBox] = useState("0 0 0 0");
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
 
   const activeImageRef = useRef<1 | 2>(1);
   useEffect(() => { activeImageRef.current = activeImage; }, [activeImage]);
+  const pathModeRef = useRef<PathMode>("polygon");
+  useEffect(() => { pathModeRef.current = pathMode; }, [pathMode]);
 
   const viewZoomRef = useRef(1);
   const viewPanXRef = useRef(0);
@@ -264,23 +368,32 @@ export default function MapEditor() {
       activeImageRef.current === 2 && imageBRef.current
         ? imageBRef.current
         : imageRef.current;
+    const pathPts = computePathPoints(
+      pointsRef.current,
+      closedRef.current,
+      pathModeRef.current
+    );
     drawScene(
       ctx,
       displayImage,
-      pointsRef.current,
+      pathPts,
       closedRef.current,
       canvas.width,
       canvas.height,
       viewZoomRef.current,
       viewPanXRef.current,
-      viewPanYRef.current
+      viewPanYRef.current,
+      false,
+      pointsRef.current
     );
     setZoomDisplay(Math.round(viewZoomRef.current * 100));
     if (closedRef.current && pointsRef.current.length >= 3) {
       const z = viewZoomRef.current;
       const px = viewPanXRef.current;
       const py = viewPanYRef.current;
-      const pts = pointsRef.current.map(p => `${p.x * z + px},${p.y * z + py}`).join(" ");
+      const pts = pathPts
+        .map((p) => `${p.x * z + px},${p.y * z + py}`)
+        .join(" ");
       setBloomPoints(pts);
       setBloomViewBox(`0 0 ${canvas.width} ${canvas.height}`);
     } else {
@@ -328,7 +441,7 @@ export default function MapEditor() {
 
   useEffect(() => {
     renderRef.current();
-  }, [points, closed, activeImage]);
+  }, [points, closed, activeImage, pathMode]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -384,6 +497,8 @@ export default function MapEditor() {
         img.onload = () => {
           imageRef.current = img;
           imageBRef.current = null;
+          mainImageBlobRef.current = file;
+          refImageBlobRef.current = null;
           setHasImage(true);
           setHasImageB(false);
           setActiveImage(1);
@@ -421,6 +536,7 @@ export default function MapEditor() {
             return;
           }
           imageBRef.current = img;
+          refImageBlobRef.current = file;
           setHasImageB(true);
           setActiveImage(2);
         };
@@ -559,7 +675,12 @@ export default function MapEditor() {
     setDraggingIndex(null);
   }, []);
 
-  const handleExport = useCallback(() => {
+  const refreshHistory = useCallback(async () => {
+    const entries = await listHistory();
+    setHistory(entries);
+  }, []);
+
+  const handleExport = useCallback(async () => {
     const image = imageRef.current;
     if (!image || !closedRef.current || pointsRef.current.length < 3) return;
 
@@ -568,29 +689,69 @@ export default function MapEditor() {
     exportCanvas.height = image.naturalHeight;
     const ctx = exportCanvas.getContext("2d")!;
 
+    const pathPts = computePathPoints(
+      pointsRef.current,
+      true,
+      pathModeRef.current
+    );
+
     drawScene(
       ctx,
       image,
-      pointsRef.current,
+      pathPts,
       true,
       image.naturalWidth,
       image.naturalHeight,
       1,
       0,
       0,
-      true
+      true,
+      pointsRef.current
     );
 
-    exportCanvas.toBlob((blob) => {
-      if (!blob) return;
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "squad-map-boundary.png";
-      a.click();
-      URL.revokeObjectURL(url);
-    }, "image/png");
+    const blob = await canvasToBlob(exportCanvas, "image/png");
+    if (!blob) return;
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "squad-map-boundary.png";
+    a.click();
+    URL.revokeObjectURL(url);
+
+    await addHistoryEntry({
+      exportBlob: blob,
+      points: pointsRef.current,
+      pathMode: pathModeRef.current,
+      width: image.naturalWidth,
+      height: image.naturalHeight,
+    });
+    refreshHistory();
+  }, [refreshHistory]);
+
+  const downloadHistoryEntry = useCallback((entry: HistoryEntry) => {
+    const url = URL.createObjectURL(entry.exportBlob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `squad-map-${new Date(entry.ts)
+      .toISOString()
+      .replace(/[:.]/g, "-")}.png`;
+    a.click();
+    URL.revokeObjectURL(url);
   }, []);
+
+  const removeHistoryEntry = useCallback(
+    async (id: string) => {
+      await deleteHistoryEntry(id);
+      refreshHistory();
+    },
+    [refreshHistory]
+  );
+
+  const clearAllHistory = useCallback(async () => {
+    await clearHistory();
+    refreshHistory();
+  }, [refreshHistory]);
 
   const handleDrop = useCallback(
     (e: React.DragEvent<HTMLDivElement>) => {
@@ -637,6 +798,61 @@ export default function MapEditor() {
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
   }, []);
+
+  // Restore session + initial history load.
+  useEffect(() => {
+    (async () => {
+      const session = await loadSession();
+      if (session && session.mainImage) {
+        try {
+          const img = await blobToImage(session.mainImage);
+          imageRef.current = img;
+          mainImageBlobRef.current = session.mainImage;
+          setHasImage(true);
+          let haveRef = false;
+          if (session.referenceImage) {
+            const refImg = await blobToImage(session.referenceImage);
+            if (
+              refImg.naturalWidth === img.naturalWidth &&
+              refImg.naturalHeight === img.naturalHeight
+            ) {
+              imageBRef.current = refImg;
+              refImageBlobRef.current = session.referenceImage;
+              setHasImageB(true);
+              haveRef = true;
+            }
+          }
+          setPoints(session.points ?? []);
+          setClosed(session.closed ?? false);
+          setPathMode(session.pathMode ?? "polygon");
+          setActiveImage(haveRef ? session.activeImage ?? 1 : 1);
+          setTimeout(() => fitImageToView(), 0);
+        } catch {
+          // ignore bad data
+        }
+      }
+      hydratedRef.current = true;
+      refreshHistory();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Auto-save session (debounced).
+  useEffect(() => {
+    if (!hydratedRef.current || !hasImage) return;
+    const handle = window.setTimeout(() => {
+      if (!mainImageBlobRef.current) return;
+      saveSession({
+        mainImage: mainImageBlobRef.current,
+        referenceImage: refImageBlobRef.current ?? undefined,
+        points,
+        closed,
+        pathMode,
+        activeImage,
+      });
+    }, 400);
+    return () => window.clearTimeout(handle);
+  }, [points, closed, pathMode, activeImage, hasImage, hasImageB]);
 
   const cursorStyle =
     isPanningRef.current
@@ -710,6 +926,30 @@ export default function MapEditor() {
           </TooltipTrigger>
           <TooltipContent side="right">
             Switch View (currently: {activeImage === 1 ? "Main" : "Reference"})
+          </TooltipContent>
+        </Tooltip>
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              data-testid="button-path-mode"
+              onClick={() =>
+                setPathMode((prev) =>
+                  prev === "polygon" ? "spline" : "polygon"
+                )
+              }
+              disabled={!hasImage}
+              className={
+                pathMode === "spline" ? "text-[#FF4500]" : "text-gray-300"
+              }
+            >
+              <SplineIcon />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="right">
+            Path Mode: {pathMode === "polygon" ? "Polygon (straight)" : "Spline (smooth)"}
           </TooltipContent>
         </Tooltip>
 
@@ -807,6 +1047,61 @@ export default function MapEditor() {
           </TooltipTrigger>
           <TooltipContent side="right">Export PNG</TooltipContent>
         </Tooltip>
+
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              data-testid="button-history"
+              onClick={() => setHistoryOpen(true)}
+              className="text-gray-300 mt-auto"
+            >
+              <History />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="right">Export History</TooltipContent>
+        </Tooltip>
+
+        <Sheet open={historyOpen} onOpenChange={setHistoryOpen}>
+          <SheetContent
+            side="right"
+            className="w-[380px] sm:w-[420px] overflow-y-auto"
+            style={{ backgroundColor: "#1a1a2e", color: "#e5e7eb" }}
+          >
+            <SheetHeader>
+              <SheetTitle className="text-gray-100">Export History</SheetTitle>
+              <SheetDescription className="text-gray-400">
+                Stored locally in your browser (IndexedDB). Last {20} exports.
+              </SheetDescription>
+            </SheetHeader>
+            <div className="mt-4 space-y-3">
+              {history.length === 0 && (
+                <p className="text-sm text-gray-500">No exports yet.</p>
+              )}
+              {history.map((entry) => (
+                <HistoryCard
+                  key={entry.id}
+                  entry={entry}
+                  onDownload={() => downloadHistoryEntry(entry)}
+                  onDelete={() => removeHistoryEntry(entry.id)}
+                />
+              ))}
+            </div>
+            {history.length > 0 && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={clearAllHistory}
+                className="mt-6 text-gray-400 hover:text-red-400"
+                data-testid="button-clear-history"
+              >
+                <Trash2 className="w-4 h-4 mr-2" />
+                Clear all
+              </Button>
+            )}
+          </SheetContent>
+        </Sheet>
       </div>
 
       <div
@@ -898,6 +1193,16 @@ export default function MapEditor() {
                 {activeImage === 1 ? "Main" : "Reference"}
               </div>
             )}
+            <div
+              className="px-2 py-1 rounded-md text-xs"
+              style={{
+                backgroundColor: "rgba(0,0,0,0.5)",
+                color: pathMode === "spline" ? "#FF4500" : "#9ca3af",
+              }}
+              data-testid="text-path-mode"
+            >
+              {pathMode === "spline" ? "Spline" : "Polygon"}
+            </div>
             <div
               className="px-2 py-1 rounded-md text-xs text-gray-400"
               style={{ backgroundColor: "rgba(0,0,0,0.5)" }}
